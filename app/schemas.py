@@ -219,6 +219,11 @@ class VerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# 凭证签发请求结构与 /api/verify 一致：带时区绝对时刻的连续轨迹
+class PassIssueRequest(VerifyRequest):
+    pass
+
+
 class RelativePointIn(BaseModel):
     """调度请求中的轨迹点：相对首点的秒数（首点必须为 0）。"""
 
@@ -348,6 +353,27 @@ class RegionBatchResponse(_UTCDatetimeModel):
 
 class RevisionOut(BaseModel):
     revision: int
+
+
+class PointOut(_UTCDatetimeModel):
+    """持久化轨迹点（时刻统一输出 UTC ISO8601 且带 Z 后缀）。"""
+
+    x: float
+    y: float
+    t: datetime
+
+
+class PassOut(_UTCDatetimeModel):
+    """可取消通行凭证。"""
+
+    id: int
+    status: Literal["active", "cancelled", "expired"]
+    region_revision: int
+    trajectory: list[PointOut]
+    created_at: datetime
+    cancelled_at: datetime | None = None
+    first_time: datetime
+    last_time: datetime
 
 
 class ErrorOut(BaseModel):

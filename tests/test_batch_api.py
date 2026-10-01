@@ -335,11 +335,11 @@ check("不落库 revision=7 且名称未改",
       client.get("/api/revision").json()["revision"] == 7
       and client.get(f"/api/regions/{id_a}").json()["name"] == "A区-v3")
 
-# ---- 并发：N 个同 revision 批次 + M 个单条写同时发起 ----
+# ---- 并发：N 个同 revision 批次同时发起（无其它写竞争），恰好 1 个成功 ----
 base_rev = client.get("/api/revision").json()["revision"]
-N, M = 10, 3
+N = 10
 outcomes: list[tuple] = []
-barrier = threading.Barrier(N + M)
+barrier = threading.Barrier(N)
 olock = threading.Lock()
 
 
@@ -360,6 +360,35 @@ def batch_worker(i):
                          rr.json().get("error", {}).get("code")))
 
 
+threads = [threading.Thread(target=batch_worker, args=(i,)) for i in range(N)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join(timeout=30)
+
+batch_ok = [o for o in outcomes if o[0] == "batch" and o[2] == 200]
+batch_conflict = [o for o in outcomes if o[0] == "batch" and o[3] == "revision_conflict"]
+errors5xx = [o for o in outcomes if 500 <= o[2] < 600]
+check("同 revision 并发批次恰好 1 个成功", len(batch_ok) == 1, str(outcomes))
+check("其余并发批次全部 409", len(batch_conflict) == N - 1, str(outcomes))
+check("无 5xx（无死锁/序列化异常泄漏）", not errors5xx, str(errors5xx))
+after_batch_rev = client.get("/api/revision").json()["revision"]
+check(f"仅 1 个批次落库：revision = 基线 + 1 = {base_rev + 1}",
+      after_batch_rev == base_rev + 1, f"got {after_batch_rev}")
+names = [r["name"] for r in client.get("/api/regions").json() if r["name"].startswith("并发批")]
+check("只有一个并发批次的区域落库", len(names) == 1, str(names))
+
+# ---- 并发：N 个同 revision 批次 + M 个无 revision 条件的单条 PATCH 同时发起 ----
+# PATCH 不携带 expected_revision：写事务在全局 meta 行锁上串行化后，
+# 成功提交数（M 个 PATCH + 至多 1 个批次）与 revision 增量必须严格一致。
+# 若 PATCH 先全部提交，则同 revision 批次会全部 409——这同样是正确行为，
+# 因此本用例不再依赖具体交错顺序，只校验串行化不变量。
+base_rev = after_batch_rev
+N2, M = 10, 3
+outcomes = []
+barrier = threading.Barrier(N2 + M)
+
+
 def patch_worker(i):
     barrier.wait()
     rr = client.patch(f"/api/regions/{id_a}", json={"name": f"并发改名-{i}"})
@@ -368,7 +397,7 @@ def patch_worker(i):
         outcomes.append(("patch", i, rr.status_code, code))
 
 
-threads = [threading.Thread(target=batch_worker, args=(i,)) for i in range(N)]
+threads = [threading.Thread(target=batch_worker, args=(i,)) for i in range(N2, N2 + N2)]
 threads += [threading.Thread(target=patch_worker, args=(i,)) for i in range(M)]
 for t in threads:
     t.start()
@@ -379,15 +408,21 @@ batch_ok = [o for o in outcomes if o[0] == "batch" and o[2] == 200]
 batch_conflict = [o for o in outcomes if o[0] == "batch" and o[3] == "revision_conflict"]
 patch_ok = [o for o in outcomes if o[0] == "patch" and o[2] == 200]
 errors5xx = [o for o in outcomes if 500 <= o[2] < 600]
-check("并发批次恰好 1 个成功", len(batch_ok) == 1, str(outcomes))
-check("其余并发批次全部 409", len(batch_conflict) == N - 1, str(outcomes))
+unexpected = [o for o in outcomes
+              if not (o[0] == "batch" and (o[2] == 200 or o[3] == "revision_conflict"))
+              and not (o[0] == "patch" and o[2] == 200)]
 check("单条 PATCH 不受 expected_revision 限制，全部成功", len(patch_ok) == M, str(outcomes))
-check("无 5xx（无死锁/序列化异常泄漏）", not errors5xx, str(errors5xx))
+check("同 revision 批次至多 1 个成功，其余全部 409",
+      len(batch_ok) <= 1 and len(batch_ok) + len(batch_conflict) == N2, str(outcomes))
+check("无 5xx 与意外状态码（无死锁/序列化异常泄漏）",
+      not errors5xx and not unexpected, str(outcomes))
 final_rev = client.get("/api/revision").json()["revision"]
-check(f"最终 revision = 基线 + 1(批) + {M}(单条) = {base_rev + 1 + M}",
-      final_rev == base_rev + 1 + M, f"got {final_rev}")
+check(f"revision 增量 == 成功提交数（{M} 个 PATCH + {len(batch_ok)} 个批次）",
+      final_rev == base_rev + M + len(batch_ok),
+      f"got {final_rev}, expected {base_rev + M + len(batch_ok)}")
 names = [r["name"] for r in client.get("/api/regions").json() if r["name"].startswith("并发批")]
-check("只有一个并发批次的区域落库", len(names) == 1, str(names))
+check(f"落库的并发批次区域数与成功批次数一致（{len(batch_ok)}）",
+      len(names) == 1 + len(batch_ok), str(names))
 
 # ---- 并发场景：A 区被单条 PATCH 推高 revision 后，同 revision 批次必须 409 ----
 r1 = client.patch(f"/api/regions/{id_a}", json={"name": "先到先得"})

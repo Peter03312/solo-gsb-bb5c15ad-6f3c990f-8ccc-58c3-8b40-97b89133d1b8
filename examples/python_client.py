@@ -135,6 +135,53 @@ def main() -> None:
             call("DELETE", f"/api/regions/{created['region_id']}")
     show("批量示例区域已清理", {"revision": call("GET", "/api/revision")["revision"]})
 
+    # ---- 可取消通行凭证：签发 / 查询 / 取消 / 凭证对区域变更的约束 ----
+    # 登记一个 11 月生效的方区。
+    pass_region = call("POST", "/api/regions", {
+        "name": "凭证-A区",
+        "polygon": [[0, 0], [100, 0], [100, 100], [0, 100]],
+        "valid_from": "2026-11-01T00:00:00Z",
+        "valid_to": "2026-12-01T00:00:00Z",
+    })
+    rid = pass_region["region"]["id"]
+
+    # 为「未来、首点晚于当前时刻、从区域上方安全经过」的轨迹签发凭证。
+    # 穿越轨迹会收到 422 unsafe_trajectory；首点已过会收到
+    # 422 trajectory_already_started；二者都不落库。
+    issued = call("POST", "/api/passes", {
+        "points": [
+            {"x": -50, "y": 200, "t": "2026-11-15T00:00:00Z"},
+            {"x": 150, "y": 200, "t": "2026-11-15T00:01:00Z"},
+        ]
+    })
+    show("签发通行凭证（id / region_revision / 轨迹）", issued)
+    pass_id = issued["id"]
+
+    show("按 ID 查询凭证状态", call("GET", f"/api/passes/{pass_id}"))
+
+    # 凭证未取消且末点时刻未过时，区域变更必须保持其轨迹安全：
+    # 把区域向北扩大到 y=300 会穿过该轨迹 → 409 pass_conflict（整笔回滚）。
+    try:
+        call("PATCH", f"/api/regions/{rid}",
+             {"polygon": [[0, 0], [100, 0], [100, 300], [0, 300]]})
+    except urllib.error.HTTPError as exc:
+        err = json.loads(exc.read().decode())
+        show("扩大区域被生效凭证拦截", {
+            "http_status": exc.code,
+            "error": err["error"]["code"],
+            "conflict_pass_ids": [d["pass_id"] for d in err["error"]["details"]],
+        })
+
+    # 取消凭证（重复取消幂等：状态与 cancelled_at 保持首次结果）。
+    show("取消凭证", call("POST", f"/api/passes/{pass_id}/cancel"))
+    show("重复取消（结果不变）", call("POST", f"/api/passes/{pass_id}/cancel"))
+
+    # 凭证取消后不再约束区域变更。
+    show("取消后扩大区域成功", call("PATCH", f"/api/regions/{rid}", {
+        "polygon": [[0, 0], [100, 0], [100, 300], [0, 300]],
+    }))
+    call("DELETE", f"/api/regions/{rid}")
+
 
 if __name__ == "__main__":
     main()

@@ -14,13 +14,19 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import db, geometry, repository
 from .repository import (
+    ActivePassConflict,
     BatchDuplicateRegion,
     BatchInvalidOperation,
     BatchRegionsNotFound,
     BatchRevisionConflict,
     BatchUnsafeTrajectories,
+    PassAlreadyStarted,
+    PassTrajectoryUnsafe,
 )
 from .schemas import (
+    PassIssueRequest,
+    PassOut,
+    PointOut,
     RegionBatchRequest,
     RegionBatchResponse,
     RegionCreate,
@@ -48,8 +54,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.2.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交。",
+    version="1.3.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；"
+                "支持多区域变更与轨迹核验一次原子提交，以及可取消通行凭证的签发、查询与取消。",
     lifespan=lifespan,
 )
 
@@ -223,6 +230,70 @@ async def _on_batch_unsafe(_request: Request, exc: BatchUnsafeTrajectories):
     )
 
 
+# ---------------------------------------------------------------- 通行凭证错误
+
+@app.exception_handler(PassAlreadyStarted)
+async def _on_pass_already_started(_request: Request, exc: PassAlreadyStarted):
+    return _error_response(
+        422,
+        "trajectory_already_started",
+        "轨迹首点时刻必须严格晚于签发时刻；已开始（或首点已过）的轨迹不予签发",
+    )
+
+
+@app.exception_handler(PassTrajectoryUnsafe)
+async def _on_pass_unsafe(_request: Request, exc: PassTrajectoryUnsafe):
+    violated = [r for r in exc.results if r["crossings"]]
+    details = [
+        RegionResultOut.model_validate(r).model_dump(mode="json")
+        for r in _crossings_to_out(violated)
+    ]
+    return _error_response(
+        422,
+        "unsafe_trajectory",
+        "凭证轨迹在当前完整区域集合下发生穿越，凭证不予签发且不落库",
+        details,
+    )
+
+
+@app.exception_handler(ActivePassConflict)
+async def _on_active_pass_conflict(_request: Request, exc: ActivePassConflict):
+    details = []
+    for c in exc.conflicts:
+        dumped = [
+            RegionResultOut.model_validate(r).model_dump(mode="json")
+            for r in _crossings_to_out(c["results"])
+        ]
+        details.append({"pass_id": c["pass_id"], "results": dumped})
+    return _error_response(
+        409,
+        "pass_conflict",
+        "变更后完整区域集合会使仍生效（未取消且末点时刻未过）的通行凭证不再安全，"
+        "本次变更已整笔回滚且 revision 不变",
+        details,
+    )
+
+
+def _pass_to_out(row: dict, now_ts: datetime) -> PassOut:
+    """凭证数据库行 → 响应模型；状态：已取消 > 已过期 > 生效中。"""
+    if row["cancelled"]:
+        status = "cancelled"
+    elif row["last_time"] <= now_ts:
+        status = "expired"
+    else:
+        status = "active"
+    return PassOut(
+        id=row["id"],
+        status=status,
+        region_revision=row["region_revision"],
+        trajectory=[PointOut(**p) for p in row["trajectory"]],
+        created_at=row["created_at"],
+        cancelled_at=row["cancelled_at"],
+        first_time=row["first_time"],
+        last_time=row["last_time"],
+    )
+
+
 # ---------------------------------------------------------------- 区域管理
 
 @app.post("/api/regions", response_model=RegionCreatedResponse, status_code=201,
@@ -380,6 +451,85 @@ def batch_change_regions(payload: RegionBatchRequest):
     )
 
 
+# ---------------------------------------------------------------- 通行凭证
+
+@app.post("/api/passes", response_model=PassOut, status_code=201, tags=["passes"])
+def issue_pass(payload: PassIssueRequest):
+    """为一条连续轨迹签发可取消通行凭证。
+
+    * 轨迹要求与 `/api/verify` 相同：至少 2 点、带时区绝对时刻、时刻严格
+      递增，相邻点直线匀速；非法轨迹返回 422 `invalid_trajectory` 且不保存。
+    * **首点须严格晚于签发时刻**：已开始（或首点已过）的轨迹返回 422
+      `trajectory_already_started`，拒绝且不保存。
+    * 在单个读/写事务内锁定全局 `region_meta` 行，按**当前完整区域集合**
+      核验（直线匀速、边界接触即穿越、生效期左闭右开）；不安全返回 422
+      `unsafe_trajectory` 并附逐区域穿越明细，不持久化。
+    * 安全才持久化：返回凭证 ID、签发时区域集合 `region_revision` 与轨迹。
+      签发不推进区域 revision。
+    * 与凭证取消及所有区域写入共用同一把 meta 行锁，全程串行化。
+    """
+    traj = geometry.validate_trajectory(payload.points, lambda p: p.t)
+
+    with db.pool.connection() as conn:
+        conn.rollback()
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.issue_pass(cur, traj)
+                now_ts = repository.db_now(cur)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    return _pass_to_out(row, now_ts)
+
+
+@app.get("/api/passes/{pass_id}", response_model=PassOut, tags=["passes"])
+def get_pass(pass_id: int = Path(ge=1)):
+    """按 ID 查询凭证及其状态（active/cancelled/expired）；未知 ID 返回 404。"""
+    with db.pool.connection() as conn:
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            row = repository.get_pass(cur, pass_id)
+            now_ts = repository.db_now(cur)
+    if row is None:
+        raise StarletteHTTPException(
+            status_code=404,
+            detail={"error": {"code": "not_found",
+                              "message": f"通行凭证 {pass_id} 不存在"}},
+        )
+    return _pass_to_out(row, now_ts)
+
+
+@app.post("/api/passes/{pass_id}/cancel", response_model=PassOut, tags=["passes"])
+def cancel_pass(pass_id: int = Path(ge=1)):
+    """取消凭证（幂等：重复取消不改变结果，始终返回首次取消后的凭证状态）。
+
+    取消与签发、所有区域写入共用同一把 meta 行锁串行化；取消本身不推进
+    区域 revision。未知 ID 返回 404。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.cancel_pass(cur, pass_id)
+                now_ts = repository.db_now(cur)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    if row is None:
+        raise StarletteHTTPException(
+            status_code=404,
+            detail={"error": {"code": "not_found",
+                              "message": f"通行凭证 {pass_id} 不存在"}},
+        )
+    return _pass_to_out(row, now_ts)
+
+
 # ---------------------------------------------------------------- 轨迹核验
 
 @app.post("/api/verify", response_model=VerifyResponse, tags=["verification"])
@@ -500,6 +650,8 @@ def root():
             "PATCH /api/regions/{id}", "DELETE /api/regions/{id}",
             "POST /api/regions/batch",
             "GET /api/revision", "POST /api/verify", "POST /api/schedule",
+            "POST /api/passes", "GET /api/passes/{id}",
+            "POST /api/passes/{id}/cancel",
             "GET /health",
         ],
     }

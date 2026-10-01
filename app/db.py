@@ -50,6 +50,24 @@ CREATE TABLE IF NOT EXISTS regions (
 
 CREATE INDEX IF NOT EXISTS idx_regions_valid
     ON regions (valid_from, valid_to);
+
+-- 可取消通行凭证：安全员对一条带时区绝对时刻连续轨迹签发的通行许可。
+-- trajectory 以归一化后的 [{x,y,t(UTC ISO)}] JSONB 持久化；
+-- region_revision 记录签发时核验所用区域集合的 revision。
+-- 只有「未取消 且 末点时刻未过」的凭证会约束后续区域变更。
+CREATE TABLE IF NOT EXISTS passes (
+    id              BIGSERIAL PRIMARY KEY,
+    trajectory      JSONB NOT NULL,
+    region_revision BIGINT NOT NULL,
+    first_time      TIMESTAMPTZ NOT NULL,
+    last_time       TIMESTAMPTZ NOT NULL,
+    cancelled       BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    cancelled_at    TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_passes_active
+    ON passes (cancelled, last_time);
 """
 
 
