@@ -66,6 +66,24 @@ class BatchUnsafeTrajectories(Exception):
         self.trajectory_results = trajectory_results
 
 
+class PassUnsafe(Exception):
+    """待签发轨迹在当前区域集合下发生穿越；携带逐区域穿越明细。"""
+
+    def __init__(self, results: list[dict]):
+        super().__init__("轨迹在当前区域集合下发生穿越，凭证未签发")
+        self.results = results
+
+
+class PassConflict(Exception):
+    """区域变更将使未取消且未结束的凭证轨迹不再安全；携带冲突凭证 id。"""
+
+    def __init__(self, pass_ids: list[int]):
+        super().__init__(
+            f"变更后区域集合与 {len(pass_ids)} 张未取消通行凭证冲突，整笔变更已回滚"
+        )
+        self.pass_ids = pass_ids
+
+
 def _row_to_region(row: dict) -> dict:
     return {
         "id": row["id"],
@@ -76,6 +94,17 @@ def _row_to_region(row: dict) -> dict:
         "version": row["version"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def _region_row_to_geom(row: dict) -> dict:
+    """把含 wkt/valid_from/valid_to 的行转成几何核验用的区域 dict。"""
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "valid_from": _epoch(row["valid_from"]),
+        "valid_to": _epoch(row["valid_to"]),
+        "polygon": geometry.polygon_from_wkt(row["wkt"]),
     }
 
 
@@ -104,6 +133,18 @@ def create_region(cur, payload, polygon_vertices: list[list[float]]) -> tuple[di
     wkt = wkt_dumps(Polygon(polygon_vertices), rounding_precision=-1)
     # 锁定元数据行，使区域写入串行化并拿到稳定的新版本号
     get_revision(cur)
+    # 变更后的完整集合必须仍保证未取消且未结束的凭证安全
+    candidate = [
+        _region_row_to_geom(r) for r in _load_all_regions_locked(cur).values()
+    ]
+    candidate.append({
+        "id": 0,  # 新区域尚未分配 id；核验只使用几何与生效时段
+        "name": payload.name,
+        "valid_from": _epoch(payload.valid_from),
+        "valid_to": _epoch(payload.valid_to),
+        "polygon": Polygon(polygon_vertices),
+    })
+    check_passes_safe(cur, candidate, utcnow())
     cur.execute(
         """
         INSERT INTO regions (name, valid_from, valid_to, polygon, wkt)
@@ -172,6 +213,22 @@ def update_region(cur, region_id: int, payload, new_polygon) -> tuple[dict, int]
         polygon_json = row["polygon"]
         wkt = row["wkt"]
 
+    # 变更后的完整集合必须仍保证未取消且未结束的凭证安全
+    current = _load_all_regions_locked(cur)
+    candidate = []
+    for rid in sorted(current):
+        if rid == region_id:
+            candidate.append({
+                "id": region_id,
+                "name": name,
+                "valid_from": _epoch(valid_from),
+                "valid_to": _epoch(valid_to),
+                "polygon": geometry.polygon_from_wkt(wkt),
+            })
+        else:
+            candidate.append(_region_row_to_geom(current[rid]))
+    check_passes_safe(cur, candidate, utcnow())
+
     cur.execute(
         """
         UPDATE regions SET
@@ -213,6 +270,13 @@ def delete_region(cur, region_id: int) -> tuple[bool, int | None]:
     existing = cur.fetchone()
     if existing is None:
         return False, None
+    # 变更后的完整集合（移除该区域）必须仍保证未取消且未结束的凭证安全
+    candidate = [
+        _region_row_to_geom(r)
+        for rid, r in _load_all_regions_locked(cur).items()
+        if rid != region_id
+    ]
+    check_passes_safe(cur, candidate, utcnow())
     cur.execute("DELETE FROM regions WHERE id = %s", (region_id,))
     revision = bump_revision(cur)
     return True, revision
@@ -269,29 +333,14 @@ def _candidate_regions(
     """根据已计算好的操作结果构造变更后完整区域集合（供轨迹核验）。"""
     regions: list[dict] = []
     for op in op_results:
-        rid = op["region_id"]
         if op["action"] == "delete":
             continue
-        row = op["_row"]  # create/update 均为落库后的候选行
-        regions.append({
-            "id": rid,
-            "name": row["name"],
-            "valid_from": _epoch(row["valid_from"]),
-            "valid_to": _epoch(row["valid_to"]),
-            "polygon": geometry.polygon_from_wkt(row["wkt"]),
-        })
+        regions.append(_region_row_to_geom(op["_row"]))  # create/update 均为落库后的候选行
     # 未被本批涉及的现有区域原样保留
     touched = {op["region_id"] for op in op_results}
     for rid in sorted(current):
         if rid not in touched:
-            row = current[rid]
-            regions.append({
-                "id": rid,
-                "name": row["name"],
-                "valid_from": _epoch(row["valid_from"]),
-                "valid_to": _epoch(row["valid_to"]),
-                "polygon": geometry.polygon_from_wkt(row["wkt"]),
-            })
+            regions.append(_region_row_to_geom(current[rid]))
     regions.sort(key=lambda r: r["id"])
     return regions
 
@@ -430,6 +479,10 @@ def apply_batch(cur, payload, trajectories: list[list[tuple[float, float, float]
         # 不落库；region_meta 行锁随回滚释放
         raise BatchUnsafeTrajectories(all_checks)
 
+    # 6.5) 未取消且末点时刻未过的凭证，其轨迹在变更后完整集合下仍须安全；
+    #      任一冲突则整批回滚（409 pass_conflict），version/revision 不变
+    check_passes_safe(cur, candidate, utcnow())
+
     # 7) 全部轨迹安全：按操作顺序落库
     for op in op_results:
         if op["action"] == "create":
@@ -493,3 +546,122 @@ def apply_batch(cur, payload, trajectories: list[list[tuple[float, float, float]
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------- 通行凭证
+
+def load_constraining_passes(cur, now: datetime) -> list[dict]:
+    """未取消且末点时刻未过的凭证（调用方应已持有 region_meta 行锁）。
+
+    由于签发/取消与所有区域写入都在同一把 meta 行锁上串行化，本查询在
+    锁内读到的是稳定集合：锁释放前不会有新的凭证提交或取消生效。
+    """
+    cur.execute(
+        """
+        SELECT id, trajectory
+        FROM passes
+        WHERE status = 'active' AND end_time > %s
+        ORDER BY id
+        """,
+        (now,),
+    )
+    passes = []
+    for row in cur.fetchall():
+        traj = [
+            (float(p["t"]), float(p["x"]), float(p["y"]))
+            for p in row["trajectory"]
+        ]
+        passes.append({"id": row["id"], "trajectory": traj})
+    return passes
+
+
+def check_passes_safe(cur, regions: list[dict], now: datetime) -> None:
+    """核验未取消且未结束的凭证轨迹在给定区域集合下仍然安全。
+
+    任一凭证发生穿越（沿用直线匀速、边界接触即违规、生效期左闭右开规则）
+    即抛 PassConflict，调用方应回滚整笔变更。
+    """
+    conflicts: list[int] = []
+    for p in load_constraining_passes(cur, now):
+        results = geometry.verify_trajectory(p["trajectory"], regions)
+        if any(r["crossings"] for r in results):
+            conflicts.append(p["id"])
+    if conflicts:
+        raise PassConflict(conflicts)
+
+
+def issue_pass(cur, traj: list[tuple[float, float, float]]) -> dict:
+    """签发通行凭证：在持有 meta 行锁的事务内核验并持久化。
+
+    traj: [(epoch, x, y), ...]，已校验（≥2 点、时刻严格递增）。
+    首点必须晚于签发时刻（拿到写锁后的当前服务时间），否则 TrajectoryError；
+    轨迹在当前完整区域集合下不安全时抛 PassUnsafe，不落库。
+    """
+    # 锁全局元数据行：与取消、所有区域写入串行化，核验与落库之间无人插队
+    revision = get_revision(cur)
+    now = utcnow()
+    if traj[0][0] <= now.timestamp():
+        raise geometry.TrajectoryError(
+            "轨迹首点时刻必须晚于签发时刻（当前服务时间），已开始的轨迹不予签发"
+        )
+    regions = [
+        _region_row_to_geom(r) for r in _load_all_regions_locked(cur).values()
+    ]
+    results = geometry.verify_trajectory(traj, regions)
+    if any(r["crossings"] for r in results):
+        raise PassUnsafe(results)
+    cur.execute(
+        """
+        INSERT INTO passes (trajectory, start_time, end_time, status, issued_revision)
+        VALUES (%(trajectory)s::jsonb, %(start)s, %(end)s, 'active', %(revision)s)
+        RETURNING id, trajectory, status, issued_revision, created_at, cancelled_at
+        """,
+        {
+            "trajectory": json.dumps(
+                [{"x": x, "y": y, "t": t} for t, x, y in traj]
+            ),
+            "start": datetime.fromtimestamp(traj[0][0], tz=timezone.utc),
+            "end": datetime.fromtimestamp(traj[-1][0], tz=timezone.utc),
+            "revision": revision,
+        },
+    )
+    return cur.fetchone()
+
+
+def get_pass(cur, pass_id: int) -> dict | None:
+    cur.execute(
+        """
+        SELECT id, trajectory, status, issued_revision, created_at, cancelled_at
+        FROM passes WHERE id = %s
+        """,
+        (pass_id,),
+    )
+    return cur.fetchone()
+
+
+def cancel_pass(cur, pass_id: int) -> dict | None:
+    """取消凭证；重复取消幂等（已取消的直接返回现状）。未找到返回 None。"""
+    # 与签发、所有区域写入在同一把 meta 行锁上串行化
+    get_revision(cur)
+    cur.execute(
+        """
+        SELECT id, trajectory, status, issued_revision, created_at, cancelled_at
+        FROM passes WHERE id = %s
+        FOR UPDATE
+        """,
+        (pass_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    if row["status"] == "active":
+        cur.execute(
+            """
+            UPDATE passes SET status = 'cancelled', cancelled_at = now()
+            WHERE id = %s
+            RETURNING id, trajectory, status, issued_revision, created_at, cancelled_at
+            """,
+            (pass_id,),
+        )
+        row = cur.fetchone()
+    return row

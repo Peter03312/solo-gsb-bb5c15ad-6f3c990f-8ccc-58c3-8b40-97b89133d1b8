@@ -19,8 +19,12 @@ from .repository import (
     BatchRegionsNotFound,
     BatchRevisionConflict,
     BatchUnsafeTrajectories,
+    PassConflict,
+    PassUnsafe,
 )
 from .schemas import (
+    PassIssueRequest,
+    PassOut,
     RegionBatchRequest,
     RegionBatchResponse,
     RegionCreate,
@@ -48,8 +52,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.2.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交。",
+    version="1.3.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更。",
     lifespan=lifespan,
 )
 
@@ -97,6 +101,25 @@ def _crossings_to_out(results: list[dict]) -> list[dict]:
             "crossings": crossings,
         })
     return out_results
+
+
+def _pass_row_to_out(row: dict) -> dict:
+    """把 passes 表行（trajectory 为 JSONB，t 为 epoch 秒）转成 API 输出。"""
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "revision": row["issued_revision"],
+        "trajectory": [
+            {
+                "x": p["x"],
+                "y": p["y"],
+                "t": datetime.fromtimestamp(p["t"], tz=timezone.utc),
+            }
+            for p in row["trajectory"]
+        ],
+        "issued_at": row["created_at"],
+        "cancelled_at": row["cancelled_at"],
+    }
 
 
 @app.exception_handler(ValidationError)
@@ -223,6 +246,34 @@ async def _on_batch_unsafe(_request: Request, exc: BatchUnsafeTrajectories):
     )
 
 
+@app.exception_handler(PassUnsafe)
+async def _on_pass_unsafe(_request: Request, exc: PassUnsafe):
+    # 只回显有穿越的区域；经响应模型序列化（UTC Z 时刻）
+    violated = [r for r in exc.results if r["crossings"]]
+    details = [
+        RegionResultOut.model_validate(r).model_dump(mode="json")
+        for r in _crossings_to_out(violated)
+    ]
+    return _error_response(
+        422,
+        "unsafe_trajectory",
+        "轨迹在当前区域集合下发生穿越，凭证未签发且不落库",
+        details,
+    )
+
+
+@app.exception_handler(PassConflict)
+async def _on_pass_conflict(_request: Request, exc: PassConflict):
+    return _error_response(
+        409,
+        "pass_conflict",
+        str(exc),
+        [{"pass_id": pid,
+          "message": f"凭证 {pid}（未取消且末点时刻未过）的轨迹在变更后区域集合下不再安全"}
+         for pid in exc.pass_ids],
+    )
+
+
 # ---------------------------------------------------------------- 区域管理
 
 @app.post("/api/regions", response_model=RegionCreatedResponse, status_code=201,
@@ -341,11 +392,14 @@ def batch_change_regions(payload: RegionBatchRequest):
        带时区绝对时刻轨迹按现有规则（直线匀速、边界接触即穿越、生效时段
        左闭右开）核验；任一轨迹不安全返回 422 `unsafe_trajectory`，明细
        列出对应轨迹下标与穿越区间，整批不落库。
-    6. 仅当 revision 匹配、操作均合法且全部轨迹安全时，一次性落库：
-       修订沿用 version +1，整批全局 revision 只递增一次。
+    6. 未取消且末点时刻未过的通行凭证，其轨迹在变更后完整集合下仍须安全；
+       任一冲突返回 409 `pass_conflict`（details 列出冲突凭证 ID），
+       整批回滚，version/revision 不变。
+    7. 仅当 revision 匹配、操作均合法、全部轨迹与全部约束凭证安全时，
+       一次性落库：修订沿用 version +1，整批全局 revision 只递增一次。
 
-    并发区域变更（含单个登记/修订/删除）因同一把 meta 行锁在此串行化，
-    无法绕过 revision 比对与轨迹核验。
+    并发区域变更（含单个登记/修订/删除）与凭证签发/取消因同一把 meta 行锁
+    在此串行化，无法绕过 revision 比对、轨迹核验与凭证约束检查。
     """
     # 轨迹合法性（点数、有限坐标、时刻严格递增）在几何层统一报错
     trajectories = [
@@ -378,6 +432,82 @@ def batch_change_regions(payload: RegionBatchRequest):
         operations=result["operations"],
         trajectories=out_trajectories,
     )
+
+
+# ---------------------------------------------------------------- 通行凭证
+
+@app.post("/api/passes", response_model=PassOut, status_code=201,
+          responses={
+              422: {"description": "轨迹非法、已开始或在当前区域集合下不安全"},
+          },
+          tags=["passes"])
+def issue_pass(payload: PassIssueRequest):
+    """为指定通行轨迹签发可取消的通行凭证。
+
+    轨迹要求与 `/api/verify` 相同（至少 2 点、带时区绝对时刻、时刻严格递增、
+    相邻点直线匀速），且**首点时刻必须晚于签发时刻**（以服务端拿到写锁后的
+    当前时间为准）。签发在持有全局元数据行锁的写事务内完成：与取消及所有
+    区域写入串行化，按当前完整区域集合核验（边界接触即违规、生效期
+    左闭右开）。
+
+    * 安全：持久化并返回 201，携带凭证 ID、签发时的区域 `revision` 与轨迹；
+    * 不安全：422 `unsafe_trajectory`，details 列出穿越区域与起止明细，不落库；
+    * 非法或已开始：422 `invalid_trajectory`/`validation_error`，不落库。
+    """
+    # 时刻严格递增等结构校验在几何层统一报错；先快速失败避免无谓的数据库读取
+    traj = geometry.validate_trajectory(payload.points, lambda p: p.t)
+
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.issue_pass(cur, traj)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    return _pass_row_to_out(row)
+
+
+@app.get("/api/passes/{pass_id}", response_model=PassOut, tags=["passes"])
+def get_pass(pass_id: int = Path(ge=1)):
+    """按 ID 查询凭证（含状态）；未知 ID 返回 404。"""
+    with db.pool.connection() as conn:
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            row = repository.get_pass(cur, pass_id)
+    if row is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"凭证 {pass_id} 不存在"}})
+    return _pass_row_to_out(row)
+
+
+@app.post("/api/passes/{pass_id}/cancel", response_model=PassOut, tags=["passes"])
+def cancel_pass(pass_id: int = Path(ge=1)):
+    """取消凭证并返回状态；重复取消幂等（结果不变），未知 ID 返回 404。
+
+    取消与签发、所有区域写入在同一把全局元数据行锁上串行化。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.cancel_pass(cur, pass_id)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                if row is None:
+                    conn.rollback()
+                else:
+                    conn.commit()
+    if row is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"凭证 {pass_id} 不存在"}})
+    return _pass_row_to_out(row)
 
 
 # ---------------------------------------------------------------- 轨迹核验
@@ -500,6 +630,8 @@ def root():
             "PATCH /api/regions/{id}", "DELETE /api/regions/{id}",
             "POST /api/regions/batch",
             "GET /api/revision", "POST /api/verify", "POST /api/schedule",
+            "POST /api/passes", "GET /api/passes/{id}",
+            "POST /api/passes/{id}/cancel",
             "GET /health",
         ],
     }

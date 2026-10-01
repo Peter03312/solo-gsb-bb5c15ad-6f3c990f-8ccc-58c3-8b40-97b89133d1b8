@@ -4,7 +4,9 @@
 安全员在平面直角坐标系中登记带 UTC 生效时段的简单多边形区域；系统对按时刻
 严格递增、相邻点直线匀速运动的连续轨迹做整段核验，返回每个区域的穿越起止
 时刻以及总体是否安全；也可以对一条固定行程（相对秒数轨迹）在带时区的候选
-出发时段内，精确求出所有不会触碰限行区的出发区间。
+出发时段内，精确求出所有不会触碰限行区的出发区间。此外，安全员可以为指定
+通行轨迹**签发可取消的通行凭证**：未取消且行程未结束的凭证会约束后续一切
+区域变更，任何会使其轨迹不再安全的登记/修订/删除/批量变更都会被整体拒绝。
 
 ## 核验规则
 
@@ -58,7 +60,38 @@
 | 422 | `duplicate_region` | 同一现有区域在一批中出现多次 |
 | 422 | `invalid_operation` | 单条操作语义非法（如修订后 `valid_from >= valid_to`），带操作下标 |
 | 422 | `unsafe_trajectory` | 存在轨迹在变更后集合下穿越；details 列出轨迹下标与穿越起止明细 |
+| 409 | `pass_conflict` | 变更后集合将使未取消且未结束的凭证不安全；details 列出冲突凭证 id |
 | 422 | `validation_error` / `invalid_polygon` / `invalid_trajectory` | 结构/多边形/轨迹非法（同既有接口） |
+
+## 通行凭证规则（签发 / 查询 / 取消）
+
+安全员可以为一条指定通行轨迹签发**可取消的通行凭证**；未取消且行程未结束
+的凭证会约束后续所有区域写入，保证已放行的轨迹不会因区域变更而变得不安全。
+
+* **签发 `POST /api/passes`**：请求体与 `/api/verify` 相同（`points` 至少
+  2 点、带时区绝对时刻、时刻严格递增、相邻点直线匀速），且**首点时刻必须
+  晚于签发时刻**（以服务端拿到写锁后的当前时间为准；已开始的轨迹拒绝）。
+  签发在持有全局元数据行锁的写事务内完成，按**当前完整区域集合**核验，
+  沿用边界接触即违规、生效期左闭右开规则：
+  * 安全：持久化并返回 **201**，响应含凭证 `id`、`status`、`revision`
+    （签发时核验所用的区域集合版本）、回显轨迹与 `issued_at`；
+    签发不推进区域 revision；
+  * 不安全：**422** `unsafe_trajectory`，details 列出穿越区域与起止明细，
+    不落库；
+  * 非法（结构/时刻问题）或已开始：**422** `invalid_trajectory` /
+    `validation_error`，不落库。
+* **查询 `GET /api/passes/{id}`**：返回凭证（含 `status`：
+  `active`/`cancelled`）；未知 ID 返回 **404** `not_found`。
+* **取消 `POST /api/passes/{id}/cancel`**：置为 `cancelled` 并返回凭证状态；
+  **重复取消幂等**（结果不变，仍为 200）；未知 ID 返回 **404**。
+  取消不推进区域 revision。
+* **凭证约束区域变更**：**未取消且末点时刻未过**的凭证，在单区登记、修订、
+  删除及批量变更**提交前**都会被重新核验——用变更后的完整区域集合检查这些
+  凭证的轨迹是否仍然安全；任一凭证不再安全则返回 **409** `pass_conflict`
+  （details 逐条列出冲突凭证 `pass_id`），**整笔回滚**，区域 `version` 与
+  全局 `revision` 均不变。已取消或末点时刻已过的凭证不再约束。
+* **串行化**：签发、取消与所有区域写入（含批量）共用同一把全局元数据行锁，
+  完全串行化——不存在"核验通过到落库之间被并发变更插队"的漏检窗口。
 
 ## 出发时刻调度规则（`POST /api/schedule`）
 
@@ -105,7 +138,7 @@ docker compose up --build
 | http://localhost:8000/health | 健康检查 |
 | PostgreSQL | localhost:5432（用户/库/密码均为 restrict） |
 
-首次启动时应用会自动建表（`regions`、`region_meta`）并初始化全局版本号，
+首次启动时应用会自动建表（`regions`、`region_meta`、`passes`）并初始化全局版本号，
 无需手工执行 SQL。数据库未就绪时应用会自动重试连接（默认 30 次、间隔 1 秒）。
 
 停止并清理数据卷：
@@ -153,6 +186,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/revision` | 当前区域集合全局版本号（任意写操作后单调 +1） |
 | POST | `/api/verify` | 对一条绝对时刻轨迹做整段穿越核验 |
 | POST | `/api/schedule` | 对一条相对秒数固定行程，求候选时段内全部安全出发区间 |
+| POST | `/api/passes` | 为一条绝对时刻轨迹签发可取消的通行凭证（201） |
+| GET | `/api/passes/{id}` | 按 ID 查询凭证（含状态） |
+| POST | `/api/passes/{id}/cancel` | 取消凭证（幂等），返回状态 |
 
 登记示例：
 
@@ -316,6 +352,90 @@ curl -X POST http://localhost:8000/api/regions \
   多次返回 **422** `duplicate_region`；修订后时段非法等返回 **422**
   `invalid_operation`（均带操作下标）。上述任一失败整批不落库、
   revision 不变。
+* 若变更后集合会使某张未取消且未结束的通行凭证不再安全，返回 **409**
+  `pass_conflict`（见下节），整批回滚。
+
+### 通行凭证 `POST /api/passes`
+
+为指定通行轨迹签发可取消的凭证。请求体与 `/api/verify` 相同，但首点时刻
+必须晚于签发时刻（已开始的轨迹拒绝）：
+
+```json
+{
+  "points": [
+    {"x": -50, "y": 200, "t": "2026-10-01T12:00:00Z"},
+    {"x": 350, "y": 200, "t": "2026-10-01T12:05:00Z"}
+  ]
+}
+```
+
+安全时返回 **201**（`revision` 为签发时核验所用的区域集合版本）：
+
+```json
+{
+  "id": 1,
+  "status": "active",
+  "revision": 3,
+  "trajectory": [
+    {"x": -50, "y": 200, "t": "2026-10-01T12:00:00Z"},
+    {"x": 350, "y": 200, "t": "2026-10-01T12:05:00Z"}
+  ],
+  "issued_at": "2026-10-01T11:55:00Z",
+  "cancelled_at": null
+}
+```
+
+不安全时返回 **422** `unsafe_trajectory`，details 直接列出有穿越的区域
+（结构与 `/api/verify` 的 `results` 相同，只含违规区域），凭证不落库：
+
+```json
+{
+  "error": {
+    "code": "unsafe_trajectory",
+    "message": "轨迹在当前区域集合下发生穿越，凭证未签发且不落库",
+    "details": [
+      {
+        "region_id": 1,
+        "region_name": "A区-焊接作业面",
+        "crossings": [
+          {
+            "entry_time": "2026-10-01T12:00:15Z",
+            "exit_time": "2026-10-01T12:00:45Z",
+            "entry_inclusive": true,
+            "exit_inclusive": true,
+            "point_contact": false
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+查询与取消：
+
+```bash
+curl http://localhost:8000/api/passes/1          # 查询，未知 ID 返回 404
+curl -X POST http://localhost:8000/api/passes/1/cancel   # 取消，幂等
+```
+
+取消成功返回同一凭证结构，`status` 变为 `cancelled` 并带 `cancelled_at`；
+对已取消的凭证再次取消返回相同结果（幂等），未知 ID 返回 404。
+
+凭证约束区域变更的冲突响应（单区登记/修订/删除与批量变更一致）为
+**409** `pass_conflict`，details 逐条列出冲突凭证，整笔回滚：
+
+```json
+{
+  "error": {
+    "code": "pass_conflict",
+    "message": "变更后区域集合与 1 张未取消通行凭证冲突，整笔变更已回滚",
+    "details": [
+      {"pass_id": 1, "message": "凭证 1（未取消且末点时刻未过）的轨迹在变更后区域集合下不再安全"}
+    ]
+  }
+}
+```
 
 ### 出发时刻调度 `POST /api/schedule`
 
@@ -368,12 +488,15 @@ curl -X POST http://localhost:8000/api/regions \
 
 ### 错误响应
 
-统一使用 `422`（语义错误）、`404`（区域不存在）或 `409`（批量提交的
-revision 冲突）。除通用的 `validation_error` 外，轨迹类错误使用专用错误码：
-`/api/verify` 为 `invalid_trajectory`，`/api/schedule` 的相对轨迹问题同样返回
+统一使用 `422`（语义错误）、`404`（区域/凭证不存在）或 `409`（批量提交的
+revision 冲突、区域变更与未取消凭证冲突）。除通用的 `validation_error` 外，
+轨迹类错误使用专用错误码：`/api/verify` 与 `/api/passes` 为
+`invalid_trajectory`，`/api/schedule` 的相对轨迹问题同样返回
 `invalid_trajectory`，候选时段不递增返回 `invalid_input`；
 `/api/regions/batch` 另用 `revision_conflict`（409）、`region_not_found`（404）、
-`duplicate_region`、`invalid_operation`、`unsafe_trajectory`（均 422）：
+`duplicate_region`、`invalid_operation`、`unsafe_trajectory`（均 422）；
+凭证相关另用 `pass_conflict`（409，区域变更危及未取消凭证）与
+`not_found`（404，未知凭证 ID）：
 
 ```json
 {
@@ -395,7 +518,11 @@ bash examples/curl_examples.sh
 # 批量原子变更（登记/修订/删除 + 轨迹核验；含不安全拒绝、revision 冲突重放）
 bash examples/curl_batch.sh
 
-# 仅用 Python 标准库的调用示例（含调度两段安全区间演示）
+# 通行凭证（签发/查询/取消；含 409 pass_conflict 约束、幂等取消、
+# 不安全与已开始轨迹拒签）
+bash examples/curl_passes.sh
+
+# 仅用 Python 标准库的调用示例（含调度两段安全区间与通行凭证演示）
 python3 examples/python_client.py
 ```
 
@@ -415,18 +542,22 @@ DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_
 # 批量原子变更 API 集成测试（成功/各种拒绝原因/左闭右开端点/并发竞争，
 # 同样会清空 regions 表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_batch_api.py
+
+# 通行凭证 API 集成测试（签发/查询/取消、凭证约束区域变更、过期放行、
+# 签发与区域写入并发串行化，会清空 regions/passes 表）
+DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_passes_api.py
 ```
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、batch）
+  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、batch、passes）
   schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合）
   geometry.py    # 穿越核验与安全出发区间引擎（插值、裁剪、合并、区间差）
-  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务
-  db.py          # psycopg3 连接池、建表初始化、启动重试
-examples/        # curl 与 Python 调用示例（含批量原子变更）
-tests/           # 几何离线测试与 API/批量变更集成测试
+  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、通行凭证签发/取消
+  db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes）、启动重试
+examples/        # curl 与 Python 调用示例（含批量原子变更与通行凭证）
+tests/           # 几何离线测试与 API/批量变更/通行凭证集成测试
 Dockerfile, docker-compose.yml
 ```

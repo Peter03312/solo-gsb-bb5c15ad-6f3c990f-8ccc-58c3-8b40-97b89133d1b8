@@ -219,6 +219,14 @@ class VerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class PassIssueRequest(BaseModel):
+    """签发通行凭证：一条带时区绝对时刻的连续轨迹（结构同 /api/verify）。"""
+
+    points: list[PointIn] = Field(min_length=2)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class RelativePointIn(BaseModel):
     """调度请求中的轨迹点：相对首点的秒数（首点必须为 0）。"""
 
@@ -348,6 +356,29 @@ class RegionBatchResponse(_UTCDatetimeModel):
 
 class RevisionOut(BaseModel):
     revision: int
+
+
+class PassPointOut(_UTCDatetimeModel):
+    """凭证轨迹点：时刻输出 UTC ISO8601 并带 Z 后缀。"""
+
+    x: float
+    y: float
+    t: datetime
+
+
+class PassOut(_UTCDatetimeModel):
+    """通行凭证：签发/查询/取消的统一响应。
+
+    status: active（未取消）/ cancelled（已取消）；
+    revision 为签发时核验所用的区域集合版本号。
+    """
+
+    id: int
+    status: str
+    revision: int
+    trajectory: list[PassPointOut]
+    issued_at: datetime
+    cancelled_at: datetime | None
 
 
 class ErrorOut(BaseModel):

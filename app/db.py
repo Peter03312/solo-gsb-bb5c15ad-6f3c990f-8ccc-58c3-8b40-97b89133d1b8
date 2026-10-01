@@ -50,6 +50,25 @@ CREATE TABLE IF NOT EXISTS regions (
 
 CREATE INDEX IF NOT EXISTS idx_regions_valid
     ON regions (valid_from, valid_to);
+
+-- 可取消的通行凭证：签发时核验通过的轨迹；未取消且末点时刻未过的凭证
+-- 约束后续所有区域写入（登记/修订/删除/批量变更）
+CREATE TABLE IF NOT EXISTS passes (
+    id              BIGSERIAL PRIMARY KEY,
+    -- 签发时核验通过的轨迹：[{"x": .., "y": .., "t": <epoch 秒>}, ...]
+    trajectory      JSONB NOT NULL,
+    start_time      TIMESTAMPTZ NOT NULL,
+    end_time        TIMESTAMPTZ NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
+    issued_revision BIGINT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    cancelled_at    TIMESTAMPTZ,
+    CONSTRAINT passes_status_check CHECK (status IN ('active', 'cancelled')),
+    CONSTRAINT passes_time_order CHECK (start_time < end_time)
+);
+
+CREATE INDEX IF NOT EXISTS idx_passes_constraining
+    ON passes (status, end_time);
 """
 
 

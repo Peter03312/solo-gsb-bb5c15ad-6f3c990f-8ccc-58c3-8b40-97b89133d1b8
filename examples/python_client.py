@@ -10,6 +10,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 
@@ -134,6 +135,46 @@ def main() -> None:
         if created["action"] == "create":
             call("DELETE", f"/api/regions/{created['region_id']}")
     show("批量示例区域已清理", {"revision": call("GET", "/api/revision")["revision"]})
+
+    # ---- 通行凭证：签发 / 查询 / 取消，以及凭证对区域变更的约束 ----
+    # 轨迹时刻必须在签发时刻之后，这里用当前时间 +5/+10 分钟
+    t1 = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    t2 = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    pass_traj = [
+        {"x": -50, "y": 200, "t": t1},
+        {"x": 350, "y": 200, "t": t2},
+    ]
+    issued = call("POST", "/api/passes", {"points": pass_traj})
+    show("签发通行凭证（安全轨迹才持久化）", issued)
+    pass_id = issued["id"]
+
+    show("按 ID 查询凭证状态", call("GET", f"/api/passes/{pass_id}"))
+
+    # 未取消且末点时刻未过的凭证约束区域变更：压住该轨迹的登记会被 409 拒绝
+    try:
+        call("POST", "/api/regions", {
+            "name": "挡路区",
+            "polygon": [[0, 150], [100, 150], [100, 250], [0, 250]],
+            "valid_from": "2020-01-01T00:00:00Z",
+            "valid_to": "2030-01-01T00:00:00Z",
+        })
+    except urllib.error.HTTPError as exc:
+        err = json.loads(exc.read().decode())
+        show("凭证约束生效：409 pass_conflict", err)
+        conflicting = [d["pass_id"] for d in err["error"]["details"]]
+        print(f"  冲突凭证 id：{conflicting}")
+
+    # 取消（幂等，重复取消结果不变）；取消后该区域即可登记
+    show("取消凭证", call("POST", f"/api/passes/{pass_id}/cancel"))
+    show("重复取消（结果不变）", call("POST", f"/api/passes/{pass_id}/cancel"))
+    created = call("POST", "/api/regions", {
+        "name": "挡路区",
+        "polygon": [[0, 150], [100, 150], [100, 250], [0, 250]],
+        "valid_from": "2020-01-01T00:00:00Z",
+        "valid_to": "2030-01-01T00:00:00Z",
+    })
+    show("取消后原冲突区域可登记", created)
+    call("DELETE", f"/api/regions/{created['region']['id']}")
 
 
 if __name__ == "__main__":
